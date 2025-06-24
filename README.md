@@ -43,7 +43,7 @@ It pretends to be the [Just Dance Controller app](https://play.google.com/store/
 1. Download [the latest version](https://github.com/redphx/joydance/releases/latest/) and extract it into a folder.
 2. Open that folder in Terminal/Command Prompt, then run this command:
 ```
-pip3 install -r requirements.txt
+pip3 install -r requirements_improved.txt
 ```
   
 #### Extra steps for Linux users
@@ -90,11 +90,11 @@ pip3 install -r requirements.txt
 
 3. Run this command:
     ```
-    python3 dance.py
+    python3 dance_improved_fixed2.py
     ```
     or
     ```
-    python dance.py
+    python dance_improved_fixed2.py
     ```
 
 4. Open http://localhost:32623 (not https://...) in a web browser (32623 = DANCE). You can also open JoyDance on another device (connected to the same network) with this link: `http://[JOYDANCE_DEVICE_IP]:32623` (for example: `http://192.168.1.100:32623`).
