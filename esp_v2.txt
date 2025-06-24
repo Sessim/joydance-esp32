@@ -1,0 +1,426 @@
+/*
+ * JoyDance ESP32-C3 Firmware
+ * Прошивка для ESP32-C3 с IMU датчиком для JoyDance
+ * 
+ * Поддерживаемые датчики: MPU6050, MPU9250
+ * Связь: Bluetooth Low Energy (BLE)
+ * IDE: Arduino IDE 2.x
+ * 
+ * Автор: MiniMax Agent
+ * Дата: 19 июня 2025
+ */
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <Wire.h>
+//#include <Adafruit_MPU6050.h>
+//#include <Adafruit_Sensor.h>
+#include <ArduinoJson.h>
+// Замените библиотеку Adafruit на более надежную альтернативу
+#include <MPU6050_light.h>  // Используем облегченную библиотеку
+MPU6050 mpu(Wire);
+// ===== КОНФИГУРАЦИЯ =====
+// BLE настройки
+#define BLE_DEVICE_NAME "JoyDance_ESP1"           // Имя устройства (измените для каждого ESP32)
+#define SERVICE_UUID "12345678-1234-1234-1234-123456789abc"
+#define CHAR_UUID    "87654321-4321-4321-4321-cba987654321"
+// IMU настройки
+#define IMU_SAMPLE_RATE_HZ 100                   // Частота опроса IMU (Гц)
+#define SEND_INTERVAL_MS (1000 / IMU_SAMPLE_RATE_HZ)
+// I2C пины (настройте под вашу плату)
+#define SDA_PIN 22
+#define SCL_PIN 23
+// LED индикация
+#define STATUS_LED_PIN 2                         // Встроенный LED ESP32-C3
+#define LED_BLINK_DISCONNECTED 1000             // Медленное мигание
+#define LED_BLINK_CONNECTING 200                // Быстрое мигание  
+#define LED_SOLID_CONNECTED 0                   // Постоянно включен
+// Отладка
+#define DEBUG_ENABLED true
+#define SERIAL_BAUD_RATE 115200
+// Формат данных
+#define DATA_FORMAT_BINARY true                 // true = бинарный, false = JSON
+// Калибровка
+#define AUTO_CALIBRATION_ENABLED true
+#define CALIBRATION_SAMPLES 100
+#define CALIBRATION_TIME_MS 2000
+// ===== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ =====
+// BLE объекты
+BLEServer* pServer = nullptr;
+BLECharacteristic* pCharacteristic = nullptr;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+// IMU объект
+//Adafruit_MPU6050 mpu;
+// Данные калибровки
+float accel_offset[3] = {0, 0, 0};    // Смещения акселерометра
+float gyro_offset[3] = {0, 0, 0};     // Смещения гироскопа
+bool is_calibrated = false;
+// LED управление
+unsigned long lastLedUpdate = 0;
+bool ledState = false;
+int ledBlinkInterval = LED_BLINK_DISCONNECTED;
+// Тайминг
+unsigned long lastSensorRead = 0;
+unsigned long lastDebugOutput = 0;
+// Счетчики для отладки
+unsigned long packetsSent = 0;
+unsigned long errors = 0;
+// ===== СТРУКТУРА ДАННЫХ =====
+// Структура для бинарного формата (12 байт)
+struct __attribute__((packed)) IMUData {
+    int16_t ax, ay, az;    // Акселерометр ±8g -> int16
+    int16_t gx, gy, gz;    // Гироскоп ±500°/s -> int16
+};
+// ===== ОТЛАДОЧНЫЕ МАКРОСЫ =====
+#if DEBUG_ENABLED
+    #define DEBUG_PRINT(fmt, ...) Serial.printf("[DEBUG] " fmt "\n", ##__VA_ARGS__)
+    #define INFO_PRINT(fmt, ...) Serial.printf("[INFO] " fmt "\n", ##__VA_ARGS__)
+    #define ERROR_PRINT(fmt, ...) Serial.printf("[ERROR] " fmt "\n", ##__VA_ARGS__)
+#else
+    #define DEBUG_PRINT(fmt, ...)
+    #define INFO_PRINT(fmt, ...)
+    #define ERROR_PRINT(fmt, ...)
+#endif
+// ===== BLE CALLBACK КЛАССЫ =====
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+        deviceConnected = true;
+        ledBlinkInterval = LED_SOLID_CONNECTED;
+        INFO_PRINT("Client connected");
+    }
+    void onDisconnect(BLEServer* pServer) {
+        deviceConnected = false;
+        ledBlinkInterval = LED_BLINK_DISCONNECTED;
+        INFO_PRINT("Client disconnected");
+    }
+};
+// ===== УТИЛИТАРНЫЕ ФУНКЦИИ =====
+// Преобразование g в int16 для передачи
+int16_t gToInt16(float g_value) {
+    return (int16_t)(g_value * 32768.0f / 8.0f);  // ±8g диапазон
+}
+// Преобразование °/s в int16 для передачи
+int16_t dpsToInt16(float dps_value) {
+    return (int16_t)(dps_value * 32768.0f / 500.0f);  // ±500°/s диапазон
+}
+// Управление LED
+void updateStatusLed() {
+    unsigned long currentTime = millis();
+    
+    if (ledBlinkInterval == LED_SOLID_CONNECTED) {
+        // Постоянно включен при подключении
+        digitalWrite(STATUS_LED_PIN, HIGH);
+    } else if (currentTime - lastLedUpdate >= ledBlinkInterval) {
+        ledState = !ledState;
+        digitalWrite(STATUS_LED_PIN, ledState);
+        lastLedUpdate = currentTime;
+    }
+}
+// ===== КАЛИБРОВКА IMU =====
+void calibrateIMU() {
+    if (!AUTO_CALIBRATION_ENABLED) return;
+    
+    INFO_PRINT("Starting IMU calibration...");
+    INFO_PRINT("Keep device still for %d seconds", CALIBRATION_TIME_MS / 1000);
+    
+    // Сброс смещений
+    for (int i = 0; i < 3; i++) {
+        accel_offset[i] = 0;
+        gyro_offset[i] = 0;
+    }
+    
+    // Накопление значений
+    float accel_sum[3] = {0, 0, 0};
+    float gyro_sum[3] = {0, 0, 0};
+    int valid_samples = 0;
+    
+    unsigned long startTime = millis();
+    
+    while (millis() - startTime < CALIBRATION_TIME_MS) {
+        // Используем методы новой библиотеки
+        mpu.update();
+        
+        accel_sum[0] += mpu.getAccX();
+        accel_sum[1] += mpu.getAccY();
+        accel_sum[2] += mpu.getAccZ();
+        
+        gyro_sum[0] += mpu.getGyroX();
+        gyro_sum[1] += mpu.getGyroY();
+        gyro_sum[2] += mpu.getGyroZ();
+        
+        valid_samples++;
+        
+        delay(10);
+        
+        // Мигание LED во время калибровки
+        if ((millis() - startTime) % 100 == 0) {
+            digitalWrite(STATUS_LED_PIN, !digitalRead(STATUS_LED_PIN));
+        }
+    }
+    
+    if (valid_samples > CALIBRATION_SAMPLES) {
+        // Вычисление смещений
+        accel_offset[0] = accel_sum[0] / valid_samples;
+        accel_offset[1] = accel_sum[1] / valid_samples;
+        accel_offset[2] = (accel_sum[2] / valid_samples) - 1.0; // Компенсация гравитации (1g)
+        
+        gyro_offset[0] = gyro_sum[0] / valid_samples;
+        gyro_offset[1] = gyro_sum[1] / valid_samples;
+        gyro_offset[2] = gyro_sum[2] / valid_samples;
+        
+        is_calibrated = true;
+        
+        INFO_PRINT("Calibration complete! Samples: %d", valid_samples);
+        INFO_PRINT("Accel offsets: %.3f, %.3f, %.3f", accel_offset[0], accel_offset[1], accel_offset[2]);
+        INFO_PRINT("Gyro offsets: %.3f, %.3f, %.3f", gyro_offset[0], gyro_offset[1], gyro_offset[2]);
+    } else {
+        ERROR_PRINT("Calibration failed! Not enough samples: %d", valid_samples);
+        is_calibrated = false;
+    }
+}
+// ===== ИНИЦИАЛИЗАЦИЯ IMU =====
+bool initIMU() {
+    INFO_PRINT("Initializing IMU...");
+    
+    // Инициализация I2C
+    Wire.begin(SDA_PIN, SCL_PIN);
+    delay(100);
+    
+    // Инициализация через альтернативную библиотеку
+    byte status = mpu.begin();
+    if(status != 0){
+        ERROR_PRINT("MPU init failed. Error: %d", status);
+        return false;
+    }
+    
+    INFO_PRINT("Calibrating MPU...");
+    mpu.calcOffsets(true, true);  // Калибровка гироскопа и акселерометра
+    
+    INFO_PRINT("MPU6050 initialized!");
+    return true;
+}
+
+// ===== ИНИЦИАЛИЗАЦИЯ BLE =====
+void initBLE() {
+    INFO_PRINT("Initializing BLE...");
+    
+    // Инициализация BLE
+    BLEDevice::init(BLE_DEVICE_NAME);
+    
+    // Создание сервера
+    pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new MyServerCallbacks());
+    
+    // Создание сервиса
+    BLEService *pService = pServer->createService(SERVICE_UUID);
+    
+    // Создание характеристики
+    pCharacteristic = pService->createCharacteristic(
+        CHAR_UUID,
+        BLECharacteristic::PROPERTY_READ |
+        BLECharacteristic::PROPERTY_NOTIFY
+    );
+    
+    // Добавление дескриптора для уведомлений
+    pCharacteristic->addDescriptor(new BLE2902());
+    
+    // Запуск сервиса
+    pService->start();
+    
+    // Настройка рекламы
+    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+    pAdvertising->addServiceUUID(SERVICE_UUID);
+    pAdvertising->setScanResponse(false);
+    pAdvertising->setMinPreferred(0x0);  // Помогает решить проблемы подключения iOS
+    
+    // Запуск рекламы
+    BLEDevice::startAdvertising();
+    
+    INFO_PRINT("BLE initialized: %s", BLE_DEVICE_NAME);
+    INFO_PRINT("Waiting for client connection...");
+}
+// ===== ОТПРАВКА ДАННЫХ =====
+// ===== ОТПРАВКА ДАННЫХ =====
+void sendSensorData() {
+    if (!deviceConnected) return;
+    
+    // Обновляем показания датчика
+    mpu.update();
+    
+    // Получаем калиброванные данные напрямую
+    float ax = mpu.getAccX();
+    float ay = mpu.getAccY();
+    float az = mpu.getAccZ();
+    float gx = mpu.getGyroX();
+    float gy = mpu.getGyroY();
+    float gz = mpu.getGyroZ();
+    
+    // Применяем дополнительную калибровку (если нужно)
+    if (is_calibrated) {
+        ax -= accel_offset[0];
+        ay -= accel_offset[1];
+        az -= accel_offset[2];
+        gx -= gyro_offset[0];
+        gy -= gyro_offset[1];
+        gz -= gyro_offset[2];
+    }
+    
+    // Подготовка данных для отправки
+    if (DATA_FORMAT_BINARY) {
+        IMUData data;
+        data.ax = gToInt16(ax);
+        data.ay = gToInt16(ay);
+        data.az = gToInt16(az);
+        data.gx = dpsToInt16(gx);
+        data.gy = dpsToInt16(gy);
+        data.gz = dpsToInt16(gz);
+        
+        pCharacteristic->setValue((uint8_t*)&data, sizeof(data));
+    } else {
+        // JSON формат
+        StaticJsonDocument<200> doc;
+        doc["ax"] = round(ax * 1000) / 1000.0;
+        doc["ay"] = round(ay * 1000) / 1000.0;
+        doc["az"] = round(az * 1000) / 1000.0;
+        doc["gx"] = round(gx * 100) / 100.0;
+        doc["gy"] = round(gy * 100) / 100.0;
+        doc["gz"] = round(gz * 100) / 100.0;
+        doc["temp"] = round(mpu.getTemp() * 10) / 10.0;
+        
+        String jsonString;
+        serializeJson(doc, jsonString);
+        pCharacteristic->setValue(jsonString.c_str());
+    }
+    
+    // Отправка уведомления
+    pCharacteristic->notify();
+    packetsSent++;
+    
+    DEBUG_PRINT("Sent: ax=%.2f, ay=%.2f, az=%.2f, gx=%.1f, gy=%.1f, gz=%.1f", 
+                 ax, ay, az, gx, gy, gz);
+}
+// ===== ОТЛАДОЧНАЯ ИНФОРМАЦИЯ =====
+void printDebugInfo() {
+    unsigned long currentTime = millis();
+    if (currentTime - lastDebugOutput >= 5000) {  // Каждые 5 секунд
+        INFO_PRINT("=== STATUS ===");
+        INFO_PRINT("Uptime: %lu seconds", currentTime / 1000);
+        INFO_PRINT("BLE connected: %s", deviceConnected ? "Yes" : "No");
+        INFO_PRINT("Packets sent: %lu", packetsSent);
+        INFO_PRINT("Errors: %lu", errors);
+        INFO_PRINT("Calibrated: %s", is_calibrated ? "Yes" : "No");
+        INFO_PRINT("Free heap: %d bytes", ESP.getFreeHeap());
+        INFO_PRINT("Data format: %s", DATA_FORMAT_BINARY ? "Binary" : "JSON");
+        INFO_PRINT("Sample rate: %d Hz", IMU_SAMPLE_RATE_HZ);
+        
+        lastDebugOutput = currentTime;
+    }
+}
+// ===== ОБРАБОТКА ПЕРЕПОДКЛЮЧЕНИЯ =====
+void handleReconnection() {
+    // Перезапуск рекламы при отключении
+    if (!deviceConnected && oldDeviceConnected) {
+        delay(500); // Небольшая задержка для стабильности
+        pServer->startAdvertising();
+        INFO_PRINT("Restarted advertising");
+        oldDeviceConnected = deviceConnected;
+    }
+    
+    // Подключение установлено
+    if (deviceConnected && !oldDeviceConnected) {
+        oldDeviceConnected = deviceConnected;
+    }
+}
+// ===== ОСНОВНЫЕ ФУНКЦИИ ARDUINO =====
+void setup() {
+    // Инициализация Serial
+    Serial.begin(SERIAL_BAUD_RATE);
+    delay(1000);
+    
+    INFO_PRINT("=================================");
+    INFO_PRINT("JoyDance ESP32-C3 Firmware v1.0");
+    INFO_PRINT("Device: %s", BLE_DEVICE_NAME);
+    INFO_PRINT("=================================");
+    
+    // Инициализация LED
+    pinMode(STATUS_LED_PIN, OUTPUT);
+    digitalWrite(STATUS_LED_PIN, LOW);
+    
+
+    // Инициализация IMU
+    if (!initIMU()) {
+        ERROR_PRINT("IMU initialization failed!");
+        while (1) {
+            digitalWrite(STATUS_LED_PIN, HIGH);
+            delay(100);
+            digitalWrite(STATUS_LED_PIN, LOW);
+            delay(100);
+        }
+    }
+    
+    // Калибровка IMU
+    calibrateIMU();
+    
+    // Инициализация BLE
+    initBLE();
+    
+    // Сигнал готовности
+    for (int i = 0; i < 3; i++) {
+        digitalWrite(STATUS_LED_PIN, HIGH);
+        delay(200);
+        digitalWrite(STATUS_LED_PIN, LOW);
+        delay(200);
+    }
+    
+    INFO_PRINT("Setup complete! Ready for connections.");
+}
+void loop() {
+    unsigned long currentTime = millis();
+    
+    // Управление LED
+    updateStatusLed();
+    
+    // Отправка данных датчика
+    if (currentTime - lastSensorRead >= SEND_INTERVAL_MS) {
+        sendSensorData();
+        lastSensorRead = currentTime;
+    }
+    
+    // Обработка переподключения
+    handleReconnection();
+    
+    // Отладочная информация
+    #if DEBUG_ENABLED
+    printDebugInfo();
+    #endif
+    
+    // Небольшая задержка для стабильности
+    delay(1);
+}
+// ===== ДОПОЛНИТЕЛЬНЫЕ ФУНКЦИИ =====
+// Функция для ручной калибровки (вызывается по команде)
+void recalibrate() {
+    INFO_PRINT("Manual recalibration requested");
+    calibrateIMU();
+}
+// Функция для изменения частоты в рантайме
+void setSampleRate(int newRate) {
+    if (newRate >= 10 && newRate <= 200) {
+        // Обновление глобальной переменной невозможно из-за #define
+        INFO_PRINT("Sample rate change requested: %d Hz", newRate);
+        INFO_PRINT("Restart device to apply new sample rate");
+    } else {
+        ERROR_PRINT("Invalid sample rate: %d (must be 10-200 Hz)", newRate);
+    }
+}
+// Получение статистики производительности
+void getPerformanceStats() {
+    INFO_PRINT("=== PERFORMANCE STATS ===");
+    INFO_PRINT("Total packets sent: %lu", packetsSent);
+    INFO_PRINT("Total errors: %lu", errors);
+    INFO_PRINT("Error rate: %.2f%%", (float)errors / (packetsSent + errors) * 100);
+    INFO_PRINT("Uptime: %lu seconds", millis() / 1000);
+    INFO_PRINT("Average packet rate: %.1f Hz", (float)packetsSent / (millis() / 1000.0));
+}
