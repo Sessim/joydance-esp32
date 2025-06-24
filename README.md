@@ -5,6 +5,11 @@
 ## Demo
 https://youtu.be/f_1IkUHFdH8
 
+## Features esp32
+- Support esp32 (or other with ble) + IMU (tested on MPU-6050)
+
+⚠️ **Important**: this version does not use buttons
+  
 ## Features
 - Play Just Dance 2016 and later on all platforms with Joy-Cons.
 - Playing with a Joy-Con (+ its strap) is safer and more comfortable than holding a phone.
